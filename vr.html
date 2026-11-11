@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VR-мишень — прототип</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #1b2a3a; font-family: sans-serif; }
+  canvas { display: block; }
+  #hint { position: fixed; left: 12px; top: 12px; color: #cfe3ff; font-size: 14px; line-height: 1.4;
+          pointer-events: none; text-shadow: 0 1px 2px #000; }
+</style>
+<!-- Three.js r160 через CDN (importmap + ES-модули), сборка не нужна -->
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="hint">VR-мишень. Нажмите «ENTER VR» внизу экрана.</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { VRButton } from 'three/addons/webxr/VRButton.js';
+
+/* ============================================================
+   НАСТРОЙКИ
+   ============================================================ */
+const ROOM = 10;                        // размер комнаты, м (10x10)
+const HALF = ROOM / 2;                  // от центра до края, м
+const MOVE_SPEED = 1.5;                 // скорость ходьбы, м/с
+const SNAP_ANGLE = THREE.MathUtils.degToRad(30); // шаг snap turn
+const STICK_DEAD = 0.15;                // мёртвая зона стика
+const BALL_COUNT = 7;                   // количество шаров
+const BALL_R = 0.12;                    // радиус шара, м
+const GRAB_DIST = 0.3;                  // радиус захвата шара, м
+const HAND_OFFSET = 0.15;               // точка хвата: на столько впереди контроллера, м
+const GRAVITY = -4.0;                   // «лёгкая» гравитация, м/с²
+const BOUNCE = 0.7;                     // упругость отскока от пола
+const WALL_BOUNCE = 0.5;                // упругость отскока от стен
+const THROW_BOOST = 1.4;                // множитель скорости броска
+const MAX_THROW = 14;                   // максимум скорости броска, м/с
+const TARGET_POS = new THREE.Vector3(0, 1.5, -HALF); // центр мишени (на северной стене)
+const TARGET_R = 0.6;                   // радиус мишени, м
+const RESPAWN_DELAY = 1.0;              // через сколько секунд появляется новый шар
+
+/* Временные векторы (чтобы не создавать объекты каждый кадр) */
+const UP = new THREE.Vector3(0, 1, 0);
+const _fwd = new THREE.Vector3(), _right = new THREE.Vector3(), _move = new THREE.Vector3();
+const _head = new THREE.Vector3(), _off = new THREE.Vector3(), _cand = new THREE.Vector3();
+const _axis = new THREE.Vector3(), _q = new THREE.Quaternion();
+
+/* ============================================================
+   РЕНДЕРЕР + XR
+   ============================================================ */
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.xr.enabled = true;                      // включаем WebXRManager
+renderer.xr.setReferenceSpaceType('local-floor'); // начало координат — на полу
+document.body.appendChild(renderer.domElement);
+
+// Кнопка «Enter VR» (VRButton из three/addons)
+document.body.appendChild(
+  VRButton.createButton(renderer, { optionalFeatures: ['local-floor', 'bounded-floor'] })
+);
+
+// При старте сессии явно запрашиваем reference space 'local-floor'
+renderer.xr.addEventListener('sessionstart', async () => {
+  const session = renderer.xr.getSession();
+  try {
+    const space = await session.requestReferenceSpace('local-floor');
+    renderer.xr.setReferenceSpace(space);
+  } catch (err) {
+    console.warn('local-floor недоступен:', err);
+  }
+});
+
+// При выходе из VR возвращаем камеру в «экранный» режим
+renderer.xr.addEventListener('sessionend', () => {
+  rig.position.set(0, 0, 2.5);
+  rig.rotation.set(0, 0, 0);
+  camera.position.set(0, 1.6, 0);
+  camera.quaternion.identity();
+});
+
+/* ============================================================
+   СЦЕНА, КАМЕРА, «РИГ» ИГРОКА
+   ============================================================ */
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1b2a3a);     // однотонное небо/фон
+
+const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.05, 50);
+camera.position.set(0, 1.6, 0);                   // в VR позицию перезапишет трекинг головы
+
+// Рига (dolly): двигаем и поворачиваем его, а камера и контроллеры — его дети
+const rig = new THREE.Group();
+rig.position.set(0, 0, 2.5);
+rig.add(camera);
+scene.add(rig);
+
+/* Освещение: hemisphere + directional */
+scene.add(new THREE.HemisphereLight(0xdfeaff, 0x445566, 2.5));
+const sun = new THREE.DirectionalLight(0xffffff, 2.5);
+sun.position.set(3, 6, 4);
+scene.add(sun);
+
+/* ============================================================
+   ПОЛ, ГРАНИЦЫ, МИШЕНЬ
+   ============================================================ */
+// Текстура сетки пола, нарисованная на canvas (1 плитка = 1 метр)
+function makeGridTexture() {
+  const c = document.createElement('canvas');
+  c.width = c.height = 256;
+  const g = c.getContext('2d');
+  g.fillStyle = '#34495e';
+  g.fillRect(0, 0, 256, 256);
+  g.strokeStyle = '#5d7a96';
+  g.lineWidth = 6;
+  g.strokeRect(0, 0, 256, 256);
+  const t = new THREE.CanvasTexture(c);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.repeat.set(ROOM, ROOM);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  return t;
+}
+const floor = new THREE.Mesh(
+  new THREE.PlaneGeometry(ROOM, ROOM),
+  new THREE.MeshStandardMaterial({ map: makeGridTexture(), roughness: 0.9 })
+);
+floor.rotation.x = -Math.PI / 2;
+scene.add(floor);
+
+// Стены-невидимки: логические (в коде), а по краю пола — тонкая подсветка границы
+const edge = new THREE.LineLoop(
+  new THREE.BufferGeometry().setFromPoints([
+    new THREE.Vector3(-HALF, 0.01, -HALF), new THREE.Vector3(HALF, 0.01, -HALF),
+    new THREE.Vector3(HALF, 0.01, HALF),   new THREE.Vector3(-HALF, 0.01, HALF)
+  ]),
+  new THREE.LineBasicMaterial({ color: 0x66ccff })
+);
+scene.add(edge);
+
+// Щит на северной стене, на котором висит мишень
+const board = new THREE.Mesh(
+  new THREE.BoxGeometry(1.5, 1.5, 0.1),
+  new THREE.MeshStandardMaterial({ color: 0x2c3e50, roughness: 0.8 })
+);
+board.position.set(TARGET_POS.x, TARGET_POS.y, -HALF - 0.05);
+scene.add(board);
+
+// Мишень: концентрические кольца (RingGeometry) + центр + золотой торус-обод
+const target = new THREE.Group();
+target.position.set(TARGET_POS.x, TARGET_POS.y, -HALF + 0.01);
+for (let i = 0; i < 4; i++) {
+  const outer = TARGET_R - i * 0.15;
+  const ring = new THREE.Mesh(
+    new THREE.RingGeometry(outer - 0.15, outer, 48),
+    new THREE.MeshStandardMaterial({ color: i % 2 === 0 ? 0xffffff : 0xe74c3c, roughness: 0.7 })
+  );
+  target.add(ring);
+}
+target.add(new THREE.Mesh(
+  new THREE.CircleGeometry(0.15, 32),
+  new THREE.MeshStandardMaterial({ color: 0xf1c40f, roughness: 0.6 })
+));
+const rim = new THREE.Mesh(
+  new THREE.TorusGeometry(TARGET_R, 0.02, 8, 48),
+  new THREE.MeshStandardMaterial({ color: 0xd4af37, metalness: 0.5, roughness: 0.4 })
+);
+target.add(rim);
+scene.add(target);
+
+/* ============================================================
+   СЧЁТ: CanvasTexture на плоскости над мишенью
+   ============================================================ */
+let score = 0;
+let scorePulse = 0;                               // анимация «пульса» при попадании
+const scoreCanvas = document.createElement('canvas');
+scoreCanvas.width = 512; scoreCanvas.height = 128;
+const scoreCtx = scoreCanvas.getContext('2d');
+const scoreTex = new THREE.CanvasTexture(scoreCanvas);
+scoreTex.colorSpace = THREE.SRGBColorSpace;
+
+function drawScore() {
+  const g = scoreCtx;
+  g.clearRect(0, 0, 512, 128);
+  g.fillStyle = 'rgba(10,20,35,0.8)';
+  g.fillRect(0, 0, 512, 128);
+  g.strokeStyle = '#66ccff';
+  g.lineWidth = 4;
+  g.strokeRect(2, 2, 508, 124);
+  g.fillStyle = '#ffffff';
+  g.font = 'bold 72px sans-serif';
+  g.textAlign = 'center';
+  g.textBaseline = 'middle';
+  g.fillText('СЧЁТ: ' + score, 256, 68);
+  scoreTex.needsUpdate = true;
+}
+const scorePanel = new THREE.Mesh(
+  new THREE.PlaneGeometry(2.4, 0.6),
+  new THREE.MeshBasicMaterial({ map: scoreTex, transparent: true })
+);
+scorePanel.position.set(0, 2.9, -HALF + 0.05);    // над мишенью, лицом к игроку
+scene.add(scorePanel);
+drawScore();
+
+/* ============================================================
+   ШАРЫ
+   ============================================================ */
+// Текстура шара (полосы), чтобы было видно вращение
+const ballTex = (() => {
+  const c = document.createElement('canvas');
+  c.width = 128; c.height = 64;
+  const g = c.getContext('2d');
+  g.fillStyle = '#ffffff';
+  g.fillRect(0, 0, 128, 64);
+  g.fillStyle = '#9aa0a6';
+  g.fillRect(0, 24, 128, 16);                     // «экватор»
+  g.fillRect(60, 0, 8, 64);                       // «меридиан»
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+})();
+
+const ballGeo = new THREE.SphereGeometry(BALL_R, 24, 16);
+const ballColors = [0xff5252, 0xffb142, 0xffd32a, 0x2ed573, 0x1e90ff, 0xa55eea, 0xff6b81, 0x7bed9f];
+const balls = [];
+
+// Ставит шар в случайное место на полу (не рядом с головой и другими шарами)
+function placeBallOnFloor(b) {
+  camera.getWorldPosition(_head);
+  for (let tries = 0; tries < 30; tries++) {
+    _cand.set((Math.random() - 0.5) * 7, BALL_R, -2.5 + Math.random() * 6);
+    const farFromHead = Math.hypot(_cand.x - _head.x, _cand.z - _head.z) > 0.8;
+    const free = balls.every(o => o === b || !o.userData.active ||
+                                  o.position.distanceTo(_cand) > BALL_R * 2.5);
+    if (farFromHead && free) break;
+  }
+  b.position.copy(_cand);
+  b.userData.vel.set(0, 0, 0);
+}
+
+for (let i = 0; i < BALL_COUNT; i++) {
+  const mesh = new THREE.Mesh(
+    ballGeo,
+    new THREE.MeshStandardMaterial({ color: ballColors[i % ballColors.length], map: ballTex, roughness: 0.5 })
+  );
+  // vel — скорость; holder — рука, в которой шар; active — шар в игре; respawnAt — время возрождения
+  mesh.userData = { vel: new THREE.Vector3(), holder: null, active: true, respawnAt: 0, thrownBy: null };
+  placeBallOnFloor(mesh);
+  scene.add(mesh);
+  balls.push(mesh);
+}
+
+function respawn(b) {
+  placeBallOnFloor(b);
+  b.userData.active = true;
+  b.userData.holder = null;
+  b.visible = true;
+}
+
+// Попадание в мишень: +1 к счёту, шар исчезает, новый появится через RESPAWN_DELAY
+function hitTarget(b) {
+  const u = b.userData;
+  u.active = false;
+  b.visible = false;
+  u.respawnAt = now + RESPAWN_DELAY;
+  score++;
+  scorePulse = 1;
+  drawScore();
+  if (u.thrownBy) pulse(u.thrownBy, 0.8, 120);
+}
+
+/* ============================================================
+   РУКИ (КОНТРОЛЛЕРЫ): хват и бросок
+   ============================================================ */
+const hands = [];
+
+// Точка хвата: чуть впереди контроллера (в мировых координатах)
+function handPoint(hand, out) {
+  out.set(0, 0, -HAND_OFFSET);
+  return hand.controller.localToWorld(out);
+}
+
+// Вибрация контроллера (если поддерживается)
+function pulse(hand, strength, ms) {
+  const gp = hand.inputSource && hand.inputSource.gamepad;
+  const act = gp && gp.hapticActuators && gp.hapticActuators[0];
+  if (act && act.pulse) {
+    try { const p = act.pulse(strength, ms); if (p && p.catch) p.catch(() => {}); } catch (e) {}
+  }
+}
+
+// Скорость руки по истории позиций за последние ~0.1 с
+function handVelocity(hand, out) {
+  const h = hand.history;
+  out.set(0, 0, 0);
+  if (h.length < 2) return out;
+  const a = h[0], b = h[h.length - 1];
+  const dt = b.t - a.t;
+  if (dt > 0.005) out.copy(b.p).sub(a.p).divideScalar(dt);
+  return out;
+}
+
+// Нажали trigger: берём ближайший свободный шар в радиусе захвата
+function grab(hand) {
+  if (hand.holding) return;
+  handPoint(hand, hand.point);
+  let best = null, bestD = GRAB_DIST;
+  for (const b of balls) {
+    if (!b.userData.active || b.userData.holder) continue;
+    const d = b.position.distanceTo(hand.point);
+    if (d < bestD) { best = b; bestD = d; }
+  }
+  if (!best) return;
+  best.userData.holder = hand;
+  best.userData.vel.set(0, 0, 0);
+  hand.holding = best;
+  pulse(hand, 0.4, 40);
+}
+
+// Отпустили trigger: бросок со скоростью руки (или просто падение, если контроллер пропал)
+function release(hand, doThrow) {
+  const b = hand.holding;
+  if (!b) return;
+  hand.holding = null;
+  b.userData.holder = null;
+  b.userData.thrownBy = hand;
+  if (doThrow) {
+    handVelocity(hand, b.userData.vel).multiplyScalar(THROW_BOOST);
+    if (b.userData.vel.length() > MAX_THROW) b.userData.vel.setLength(MAX_THROW);
+  } else {
+    b.userData.vel.set(0, 0, 0);
+  }
+}
+
+for (let i = 0; i < 2; i++) {
+  const controller = renderer.xr.getController(i); // позиция/поворот из XR input source
+  const mesh = new THREE.Mesh(                      // «рука» — простой параллелепипед
+    new THREE.BoxGeometry(0.06, 0.06, 0.14),
+    new THREE.MeshStandardMaterial({ color: 0x888888 })
+  );
+  mesh.position.z = -0.03;
+  controller.add(mesh);
+  const tip = new THREE.Mesh(                       // маркер точки хвата
+    new THREE.SphereGeometry(0.015, 8, 8),
+    new THREE.MeshBasicMaterial({ color: 0xffffff })
+  );
+  tip.position.z = -HAND_OFFSET;
+  controller.add(tip);
+  rig.add(controller);                              // контроллеры двигаются вместе с ригом
+
+  const hand = { controller, mesh, holding: null, history: [], point: new THREE.Vector3(), inputSource: null };
+  hands.push(hand);
+
+  controller.addEventListener('connected', (e) => {
+    hand.inputSource = e.data;
+    mesh.material.color.set(e.data.handedness === 'left' ? 0x3498db : 0xe67e22);
+  });
+  controller.addEventListener('disconnected', () => {
+    release(hand, false);
+    hand.inputSource = null;
+  });
+  controller.addEventListener('selectstart', () => grab(hand));
+  controller.addEventListener('selectend', () => release(hand, true));
+}
+
+/* ============================================================
+   ПЕРЕМЕЩЕНИЕ: левый стик — ходьба, правый — snap turn
+   ============================================================ */
+let snapReady = true;
+
+// Поворот рига вокруг точки pivot (чтобы игрок не «уезжал» при повороте)
+function turnAround(pivot, angle) {
+  _off.copy(rig.position).sub(pivot).applyAxisAngle(UP, angle);
+  rig.position.copy(pivot).add(_off);
+  rig.rotation.y += angle;
+}
+
+function updateLocomotion(dt) {
+  const session = renderer.xr.getSession();
+  if (!session) return;                             // вне VR ничего не двигаем
+
+  // Читаем стики из gamepad каждого input source
+  let lx = 0, ly = 0, rx = 0;
+  for (const src of session.inputSources) {
+    const gp = src.gamepad;
+    if (!gp) continue;
+    const ax = gp.axes;
+    const x = ax.length >= 4 ? ax[2] : (ax[0] || 0); // у xr-standard стик — оси 2 и 3
+    const y = ax.length >= 4 ? ax[3] : (ax[1] || 0);
+    if (src.handedness === 'left') { lx = x; ly = y; }
+    else if (src.handedness === 'right') { rx = x; }
+  }
+
+  // Плавное движение относительно направления взгляда головы
+  if (Math.hypot(lx, ly) > STICK_DEAD) {
+    camera.getWorldQuaternion(_q);
+    _fwd.set(0, 0, -1).applyQuaternion(_q);
+    if (_fwd.lengthSq() < 1e-4) _fwd.set(0, 0, -1).applyQuaternion(rig.quaternion);
+    _fwd.y = 0;
+    _fwd.normalize();
+    _right.set(-_fwd.z, 0, _fwd.x);                 // вектор «вправо» от взгляда
+    _move.set(0, 0, 0).addScaledVector(_fwd, -ly).addScaledVector(_right, lx);
+    if (_move.length() > 1) _move.normalize();
+    rig.position.addScaledVector(_move, MOVE_SPEED * dt);
+  }
+
+  // Snap turn на 30° правым стиком (с гистерезисом, чтобы не крутило непрерывно)
+  if (Math.abs(rx) > 0.7) {
+    if (snapReady) {
+      snapReady = false;
+      camera.getWorldPosition(_head);
+      turnAround(_head, rx > 0 ? -SNAP_ANGLE : SNAP_ANGLE);
+    }
+  } else if (Math.abs(rx) < 0.3) {
+    snapReady = true;
+  }
+
+  // Стены-невидимки: не даём голове выйти за пределы комнаты
+  rig.updateMatrixWorld(true);
+  camera.getWorldPosition(_head);
+  const lim = HALF - 0.3;
+  rig.position.x += THREE.MathUtils.clamp(_head.x, -lim, lim) - _head.x;
+  rig.position.z += THREE.MathUtils.clamp(_head.z, -lim, lim) - _head.z;
+}
+
+/* ============================================================
+   ОБНОВЛЕНИЕ РУК И ШАРОВ
+   ============================================================ */
+const clock = new THREE.Clock();
+let now = 0;
+
+function updateHands() {
+  for (const hand of hands) {
+    handPoint(hand, hand.point);
+    hand.history.push({ t: now, p: hand.point.clone() });
+    while (hand.history.length > 2 && now - hand.history[0].t > 0.1) hand.history.shift();
+  }
+  // Подсветка шара, который можно схватить
+  for (const b of balls) {
+    let near = false;
+    if (b.userData.active && !b.userData.holder) {
+      for (const hand of hands) {
+        if (!hand.holding && hand.controller.visible &&
+            hand.point.distanceTo(b.position) < GRAB_DIST) near = true;
+      }
+    }
+    b.material.emissive.setHex(near ? 0x555555 : 0x000000);
+  }
+}
+
+function updateBalls(dt) {
+  const lim = HALF - BALL_R;
+  for (const b of balls) {
+    const u = b.userData;
+
+    // Шар «выключен» после попадания — ждём возрождения
+    if (!u.active) {
+      if (now >= u.respawnAt) respawn(b);
+      continue;
+    }
+    // Шар в руке — просто следует за точкой хвата
+    if (u.holder) {
+      handPoint(u.holder, b.position);
+      u.vel.set(0, 0, 0);
+      continue;
+    }
+
+    const v = u.vel, p = b.position;
+
+    // Простая физика: гравитация + интегрирование
+    v.y += GRAVITY * dt;
+    p.addScaledVector(v, dt);
+
+    // Попадание в мишень (шар долетел до северной стены в пределах радиуса мишени)
+    if (v.z < 0 && p.z <= -HALF + BALL_R + 0.03 &&
+        Math.hypot(p.x - TARGET_POS.x, p.y - TARGET_POS.y) <= TARGET_R + BALL_R * 0.5) {
+      hitTarget(b);
+      continue;
+    }
+
+    // Пол: отскок или качение
+    if (p.y <= BALL_R) {
+      p.y = BALL_R;
+      if (v.y < -0.6) {
+        v.y = -v.y * BOUNCE;
+        v.x *= 0.95; v.z *= 0.95;
+      } else {
+        v.y = 0;
+        const k = Math.max(0, 1 - 1.2 * dt);        // трение качения
+        v.x *= k; v.z *= k;
+        if (v.x * v.x + v.z * v.z < 0.0004) { v.x = 0; v.z = 0; }
+      }
+    }
+
+    // Стены-невидимки: отскок
+    if (p.x > lim)       { p.x = lim;  v.x = -v.x * WALL_BOUNCE; }
+    else if (p.x < -lim) { p.x = -lim; v.x = -v.x * WALL_BOUNCE; }
+    if (p.z > lim)       { p.z = lim;  v.z = -v.z * WALL_BOUNCE; }
+    else if (p.z < -lim) { p.z = -lim; v.z = -v.z * WALL_BOUNCE; }
+
+    // Визуальное вращение шара по направлению движения
+    const hs = Math.hypot(v.x, v.z);
+    if (hs > 0.01) {
+      _axis.set(v.z, 0, -v.x).normalize();
+      b.rotateOnWorldAxis(_axis, hs * dt / BALL_R);
+    }
+  }
+}
+
+/* ============================================================
+   ГЛАВНЫЙ ЦИКЛ
+   ============================================================ */
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.05);      // ограничиваем шаг, чтобы физика не «взрывалась»
+  now = clock.elapsedTime;
+
+  updateLocomotion(dt);                             // сначала двигаем игрока
+  updateHands();                                    // потом читаем позиции рук
+  updateBalls(dt);                                  // потом физика шаров
+
+  // Пульсация табло счёта при попадании
+  scorePulse = Math.max(0, scorePulse - dt * 2);
+  scorePanel.scale.setScalar(1 + 0.25 * scorePulse);
+
+  renderer.render(scene, camera);
+});
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+</script>
+</body>
+</html>
